@@ -10,7 +10,7 @@ FLOPS_BUDGETS=(
 )
 DEPTHS=(8 10 12 14 16 18 20)
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}"
 WANDB_RUN="${WANDB_RUN:-scaling_${LABEL}}"
 EVAL_TOKENS=$((100 * 524288))  # ~100M tokens for final eval (default is ~10M)
 

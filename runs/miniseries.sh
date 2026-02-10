@@ -29,8 +29,8 @@ fi
 SERIES_NAME="${1:-${SERIES_NAME:-$(date +%b%d | tr '[:upper:]' '[:lower:]')}}"
 # Depths to train (the "miniseries")
 DEPTHS=(12 14 16 18 20 22 24 26)
-# Hardware
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+# Hardware: auto-detect GPUs, override with NPROC_PER_NODE env var
+NPROC_PER_NODE="${NPROC_PER_NODE:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}"
 # Logging
 WANDB_RUN="${WANDB_RUN:-${SERIES_NAME}_miniseries}"
 
