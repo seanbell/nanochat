@@ -29,6 +29,7 @@ from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
+from tasks.hfchat import HFChat
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -56,6 +57,8 @@ parser.add_argument("--init-lr-frac", type=float, default=1.0, help="initial LR 
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=150, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
+# Data
+parser.add_argument("--datamix", type=str, default="", help="HuggingFace dataset for SFT (e.g. allenai/tulu-3-sft-mixture). Empty = default mix.")
 # Output
 parser.add_argument("--dry-run", action="store_true", help="log to wandb but skip checkpoints/report")
 args = parser.parse_args()
@@ -102,22 +105,30 @@ for group in optimizer.param_groups:
 
 # SFT data mixture and DataLoader
 base_dir = get_base_dir()
-identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
-train_dataset = TaskMixture([
-    SmolTalk(split="train"), # 460K rows of general conversations
-    MMLU(subset="auxiliary_train", split="train"), # 100K rows of multiple choice problems drawn from ARC, MC_TEST, OBQA, RACE
-    GSM8K(subset="main", split="train"), # 8K rows teaching simple math and (calculator) tool use
-    GSM8K(subset="main", split="train"), # 2 epochs of GSM8K
-    CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
-    CustomJSON(filepath=identity_conversations_filepath), # let's do 2 epochs of these
-    SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
-    SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
-]) # total: 460K + 100K + 16K + 200K + 80K = 856K rows
-val_dataset = TaskMixture([
-    SmolTalk(split="test"), # 24K rows in test set
-    MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
-    GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
-]) # total: 24K + 14K + 1.32K ~= 39K rows
+if args.datamix:
+    # Use a HuggingFace chat dataset (e.g. allenai/Dolci-Instruct-SFT)
+    print0(f"Loading datamix: {args.datamix}")
+    train_dataset = HFChat(args.datamix, split="train", max_rows=856000) # 856K rows to match default mix
+    val_dataset = HFChat(args.datamix, split="val")
+    print0(f"Train: {len(train_dataset):,} rows, Val: {len(val_dataset):,} rows")
+else:
+    # Default nanochat mix
+    identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
+    train_dataset = TaskMixture([
+        SmolTalk(split="train"), # 460K rows of general conversations
+        MMLU(subset="auxiliary_train", split="train"), # 100K rows of multiple choice problems drawn from ARC, MC_TEST, OBQA, RACE
+        GSM8K(subset="main", split="train"), # 8K rows teaching simple math and (calculator) tool use
+        GSM8K(subset="main", split="train"), # 2 epochs of GSM8K
+        CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
+        CustomJSON(filepath=identity_conversations_filepath), # let's do 2 epochs of these
+        SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
+        SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    ]) # total: 460K + 100K + 16K + 200K + 80K = 856K rows
+    val_dataset = TaskMixture([
+        SmolTalk(split="test"), # 24K rows in test set
+        MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
+        GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
+    ]) # total: 24K + 14K + 1.32K ~= 39K rows
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.
