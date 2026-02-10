@@ -5,6 +5,7 @@ https://arxiv.org/abs/2406.11794
 TODOs:
 - All tasks ~match except for squad. We get 31% reference is 37%. Figure out why.
 """
+import math
 import random
 
 from jinja2 import Template
@@ -229,16 +230,22 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         predicted_tokens = predictions[0, si-1:ei-1]
         actual_tokens = input_ids[0, si:ei]
         is_correct = torch.all(predicted_tokens == actual_tokens).item()
+        gold_nats = losses[0, si-1:ei-1].sum().item()
+        gold_bytes = len(item['continuation'].encode('utf-8'))
     elif task_type in ['multiple_choice', 'schema']:
         # For MC/schema: find the option with lowest average loss
         mean_losses = [losses[i, si-1:ei-1].mean().item()
                         for i, (si, ei) in enumerate(zip(start_idxs, end_idxs))]
         pred_idx = mean_losses.index(min(mean_losses))
         is_correct = pred_idx == item['gold']
+        gold_idx = item['gold']
+        gold_nats = losses[gold_idx, start_idxs[gold_idx]-1:end_idxs[gold_idx]-1].sum().item()
+        gold_text = item['choices'][gold_idx] if task_type == 'multiple_choice' else item['continuation']
+        gold_bytes = len(gold_text.encode('utf-8'))
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
 
-    return is_correct
+    return is_correct, gold_nats, gold_bytes
 
 
 def evaluate_task(model, tokenizer, data, device, task_meta):
@@ -249,14 +256,22 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
+    total_nats = torch.zeros(len(data), dtype=torch.float32, device=device)
+    total_bytes = torch.zeros(len(data), dtype=torch.float32, device=device)
     # stride the examples to each rank
     for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+        is_correct, gold_nats, gold_bytes = evaluate_example(idx, model, tokenizer, data, device, task_meta)
         correct[idx] = float(is_correct)
+        total_nats[idx] = gold_nats
+        total_bytes[idx] = gold_bytes
     # sync results across all the processes if running distributed
     if world_size > 1:
         dist.barrier()
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
-    # compute the mean
+        dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+    # compute the mean accuracy and corpus-level BPB
     mean_correct = correct.mean().item()
-    return mean_correct
+    sum_bytes = total_bytes.sum().item()
+    bpb = total_nats.sum().item() / (math.log(2) * sum_bytes) if sum_bytes > 0 else float('nan')
+    return mean_correct, bpb

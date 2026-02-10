@@ -430,6 +430,8 @@ while True:
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
+            "core_bpb": results.get("core_bpb"),
+            "bpb_results": results.get("bpb_results", {}),
         })
         model.train()
 

@@ -21,6 +21,7 @@ Examples:
 """
 import os
 import csv
+import math
 import time
 import json
 import yaml
@@ -137,6 +138,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     # Evaluate each task
     results = {}
     centered_results = {}
+    bpb_results = {}
     for task in tasks:
         start_time = time.time()
         label = task['label']
@@ -158,19 +160,23 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
         if max_per_task > 0:
             data = data[:max_per_task]
 
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy, bpb = evaluate_task(model, tokenizer, data, device, task_meta)
         results[label] = accuracy
+        bpb_results[label] = bpb
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result
         elapsed = time.time() - start_time
-        print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {elapsed:.2f}s")
+        print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | bpb: {bpb:.4f} | time: {elapsed:.2f}s")
 
     core_metric = sum(centered_results.values()) / len(centered_results)
+    core_bpb = math.exp(sum(math.log(b) for b in bpb_results.values()) / len(bpb_results))
     out = {
         "results": results,
         "centered_results": centered_results,
-        "core_metric": core_metric
+        "bpb_results": bpb_results,
+        "core_metric": core_metric,
+        "core_bpb": core_bpb,
     }
     return out
 
@@ -181,6 +187,7 @@ def main():
     parser = argparse.ArgumentParser(description="Base model evaluation")
     parser.add_argument('--eval', type=str, default='core,bpb,sample', help='Comma-separated evaluations to run: core,bpb,sample (default: all)')
     parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path (e.g. openai-community/gpt2-xl)')
+    parser.add_argument('--source', type=str, default='base', choices=['base', 'sft', 'rl'], help='Checkpoint source: base|sft|rl (default: base)')
     parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag to identify the checkpoint directory')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
@@ -210,11 +217,11 @@ def main():
         model_name = args.hf_path
         model_slug = args.hf_path.replace("/", "-")
     else:
-        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
+        model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
         sequence_len = meta["model_config"]["sequence_len"]
         token_bytes = get_token_bytes(device=device)
-        model_name = f"base_model (step {meta['step']})"
-        model_slug = f"base_model_{meta['step']:06d}"
+        model_name = f"{args.source}_model (step {meta['step']})"
+        model_slug = f"{args.source}_model_{meta['step']:06d}"
 
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")
@@ -296,14 +303,15 @@ def main():
             output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
             os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
             with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
-                f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
+                f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}, {'BPB':<10}\n")
                 for label in core_results["results"]:
                     acc = core_results["results"][label]
                     centered = core_results["centered_results"][label]
-                    f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}\n")
-                f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}\n")
+                    bpb = core_results["bpb_results"][label]
+                    f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}, {bpb:<10.6f}\n")
+                f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}, {core_results['core_bpb']:<10.6f}\n")
             print0(f"\nResults written to: {output_csv_path}")
-            print0(f"CORE metric: {core_results['core_metric']:.4f}")
+            print0(f"CORE metric: {core_results['core_metric']:.4f} | CORE BPB: {core_results['core_bpb']:.4f}")
 
     # --- Log to report ---
     from nanochat.report import get_report
