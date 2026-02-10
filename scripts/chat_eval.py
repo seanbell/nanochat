@@ -28,7 +28,7 @@ from tasks.spellingbee import SpellingBee
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
-def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
+def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None, label=""):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
@@ -62,7 +62,7 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         num_passed += int(passed)
 
         # Logging (overwrite the same line in the console)
-        print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
+        print(f"\r\033[K{label}Rank {ddp_rank} | {num_passed}/{total} correct ({100*num_passed/total:.2f}%) | {total}/{num_problems} done", end='', flush=True)
 
     # Finish the in-place progress line with a newline before final summary
     print()
@@ -76,8 +76,7 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         num_passed = num_passed_tensor.item()
         total = total_tensor.item()
 
-    print0("=" * 50)
-    print0(f"Final: {num_passed}/{total} ({100*num_passed/total:.2f}%)")
+    print0(f"{label}{num_passed}/{total} correct ({100*num_passed/total:.2f}%)")
 
     # Return the accuracy
     return num_passed/total
@@ -87,7 +86,7 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 # A lot easier because we don't have to sample. Therefore, we can actually go
 # batches at a time and just check the logits for correct answer choices.
 
-def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):
+def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None, label=""):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
@@ -151,14 +150,14 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
         total = total_tensor.item()
 
     average = num_passed/total
-    print0(f"Final: {num_passed}/{total} ({100*average:.2f}%)")
+    print0(f"{label}{num_passed}/{total} correct ({100*average:.2f}%)")
     return average
 
 # -----------------------------------------------------------------------------
 
 def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
-                   max_problems=None):
+                   max_problems=None, label=""):
     # Create the evaluation object
     task_module = {
         'HumanEval': HumanEval,
@@ -169,11 +168,12 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         'SpellingBee': partial(SpellingBee, size=256, split="test"),
     }[task_name]
     task_object = task_module()
+    task_label = f"{label}{task_name} " if label else f"{task_name} "
     # Run the evaluation
     if task_object.eval_type == 'generative':
-        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
+        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems, label=task_label)
     elif task_object.eval_type == 'categorical':
-        acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
+        acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems, label=task_label)
     else:
         raise ValueError(f"Unsupported task evaluation type: {task_object.eval_type}")
     return acc
@@ -203,6 +203,8 @@ if __name__ == "__main__":
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+    depth = model.config.n_layer
+    eval_label = f"d{depth} {args.source} "
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
@@ -230,9 +232,10 @@ if __name__ == "__main__":
                 temperature=args.temperature,
                 top_k=args.top_k,
                 max_problems=args.max_problems,
+                label=eval_label,
             )
             results[task_name] = acc
-            print0(f"{task_name} accuracy: {100 * acc:.2f}%")
+            print0(f"{eval_label}{task_name} accuracy: {100 * acc:.2f}%")
 
     # Log to report
     from nanochat.report import get_report
