@@ -4,8 +4,11 @@ set -o pipefail
 # Full pipeline sweep: pretrain → eval → SFT → eval → RL → eval across multiple depths.
 # Generates scaling law data across the entire training pipeline for comparing configs.
 #
-# Usage: bash runs/fullsweep.sh [series_name]
+# Usage: bash runs/fullsweep.sh [series_name] [--from FROM_SERIES] [--sft-datamix DATAMIX]
 # Example: bash runs/fullsweep.sh baseline
+#
+# Post-training only (reuse pretrained models from another run):
+#   bash runs/fullsweep.sh dolci --from baseline2 --sft-datamix allenai/Dolci-Instruct-SFT
 #
 # Compare configs by re-running with different series names:
 #   bash runs/fullsweep.sh baseline 2>&1 | tee runs/fullsweep_baseline.log
@@ -44,6 +47,17 @@ fi
 
 # Series name: from arg, env var, or default to today's date (e.g., jan11)
 SERIES_NAME="${1:-${SERIES_NAME:-$(date +%b%d | tr '[:upper:]' '[:lower:]')}}"
+shift || true
+# Optional flags: --from (reuse pretrained models), --sft-datamix (custom SFT data)
+FROM_SERIES=""
+SFT_DATAMIX=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --from) FROM_SERIES="$2"; shift 2 ;;
+        --sft-datamix) SFT_DATAMIX="$2"; shift 2 ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
 # Depths to sweep (6 points, well-spaced in log(params) since params ~ d^3)
 DEPTHS=(${DEPTHS:-12 14 16 18 20 24})
 # Hardware: auto-detect GPUs, override with NPROC_PER_NODE env var
@@ -105,6 +119,8 @@ log "=============================================="
 log "${SERIES_NAME} Full Pipeline Sweep"
 log "Depths: ${DEPTHS[*]}"
 log "GPUs: ${NPROC_PER_NODE}"
+[ -n "$FROM_SERIES" ] && log "From: ${FROM_SERIES} (post-training only)"
+[ -n "$SFT_DATAMIX" ] && log "SFT datamix: ${SFT_DATAMIX}"
 log "=============================================="
 
 # =============================================================================
@@ -118,18 +134,30 @@ for d in "${DEPTHS[@]}"; do
 
     log "--- Phase 1: d=$d (batch_size=$BS, tag=$TAG) ---"
 
-    run_stage "[1/8]" pretrain --timed -- \
-        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \
-            --depth=$d --run="${WANDB_RUN}_d${d}_pretrain" --model-tag="${TAG}" \
-            --device-batch-size=$BS --fp8
+    if [ -z "$FROM_SERIES" ]; then
+        run_stage "[1/8]" pretrain --timed -- \
+            torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \
+                --depth=$d --run="${WANDB_RUN}_d${d}_pretrain" --model-tag="${TAG}" \
+                --device-batch-size=$BS --fp8
 
-    run_stage "[2/8]" base_eval -- \
-        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval -- \
-            --model-tag="${TAG}" --device-batch-size=$BS
+        run_stage "[2/8]" base_eval -- \
+            torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval -- \
+                --model-tag="${TAG}" --device-batch-size=$BS
+    else
+        FROM_TAG="${FROM_SERIES}_fullsweep_d${d}"
+        log "[1/8] pretrain d=$d... skipped (--from $FROM_SERIES)"
+        log "[2/8] base_eval d=$d... skipped (--from $FROM_SERIES)"
+    fi
+
+    # Build SFT command with optional --from-tag and --datamix
+    SFT_EXTRA_ARGS=""
+    [ -n "$FROM_SERIES" ] && SFT_EXTRA_ARGS="$SFT_EXTRA_ARGS --from-tag=${FROM_TAG}"
+    [ -n "$SFT_DATAMIX" ] && SFT_EXTRA_ARGS="$SFT_EXTRA_ARGS --datamix=${SFT_DATAMIX}"
 
     run_stage "[3/8]" sft --timed -- \
         torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- \
-            --run="${WANDB_RUN}_d${d}_sft" --model-tag="${TAG}" --device-batch-size=$BS
+            --run="${WANDB_RUN}_d${d}_sft" --model-tag="${TAG}" --device-batch-size=$BS \
+            $SFT_EXTRA_ARGS
 
     run_stage "[4/8]" chat_eval_sft -- \
         torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- \
