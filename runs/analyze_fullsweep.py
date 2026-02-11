@@ -119,6 +119,16 @@ def parse_chat_eval_log(text):
     return tasks
 
 
+def parse_chat_eval_bpb_log(text):
+    """Extract per-task BPB from chat eval log (task -> bpb)."""
+    if not text:
+        return {}
+    bpbs = {}
+    for match in re.finditer(r'(\S+) accuracy: [\d.]+% \| bpb: ([\d.]+)', text):
+        bpbs[match.group(1)] = float(match.group(2))
+    return bpbs
+
+
 def parse_holdout_bpb_log(text):
     if not text:
         return {}
@@ -170,15 +180,33 @@ def get_depth_metrics(results_dir, series_name, depth):
     m.update(parse_pretrain_log(log('pretrain')))
     m.update(parse_base_eval_log(log('base_eval')))
     m.update(parse_sft_log(log('sft')))
-    m['chat_sft'] = parse_chat_eval_log(log('chat_eval_sft'))
-    sft_forget = parse_holdout_bpb_log(log('sft_holdout_bpb'))
+    chat_eval_sft_text = log('chat_eval_sft')
+    m['chat_sft'] = parse_chat_eval_log(chat_eval_sft_text)
+    m['chat_sft_bpb'] = parse_chat_eval_bpb_log(chat_eval_sft_text)
+    sft_holdout_text = log('sft_holdout_bpb')
+    sft_forget = parse_holdout_bpb_log(sft_holdout_text)
+    sft_forget_eval = parse_base_eval_log(sft_holdout_text)
     if sft_forget:
         m['sft_forget_val_bpb'] = sft_forget.get('val_bpb')
+    if sft_forget_eval:
+        m['sft_forget_core'] = sft_forget_eval.get('be_core')
+        m['sft_forget_core_bpb'] = sft_forget_eval.get('be_core_bpb')
+        if 'core_tasks' in sft_forget_eval:
+            m['sft_forget_core_tasks'] = sft_forget_eval['core_tasks']
     m.update(parse_rl_log(log('rl')))
-    m['chat_rl'] = parse_chat_eval_log(log('chat_eval_rl'))
-    rl_forget = parse_holdout_bpb_log(log('rl_holdout_bpb'))
+    chat_eval_rl_text = log('chat_eval_rl')
+    m['chat_rl'] = parse_chat_eval_log(chat_eval_rl_text)
+    m['chat_rl_bpb'] = parse_chat_eval_bpb_log(chat_eval_rl_text)
+    rl_holdout_text = log('rl_holdout_bpb')
+    rl_forget = parse_holdout_bpb_log(rl_holdout_text)
+    rl_forget_eval = parse_base_eval_log(rl_holdout_text)
     if rl_forget:
         m['rl_forget_val_bpb'] = rl_forget.get('val_bpb')
+    if rl_forget_eval:
+        m['rl_forget_core'] = rl_forget_eval.get('be_core')
+        m['rl_forget_core_bpb'] = rl_forget_eval.get('be_core_bpb')
+        if 'core_tasks' in rl_forget_eval:
+            m['rl_forget_core_tasks'] = rl_forget_eval['core_tasks']
 
     return m
 
@@ -236,21 +264,29 @@ def write_csvs(results_dir, depths, all_metrics):
             'pretrain_time_sec': pt_time_sec,
             'sft_val_bpb': m.get('sft_val_bpb'),
             'sft_forget_bpb': m.get('sft_forget_val_bpb'),
+            'sft_forget_core': m.get('sft_forget_core'),
+            'sft_forget_core_bpb': m.get('sft_forget_core_bpb'),
             'sft_time_sec': sft_time_sec,
         }
 
         # Chat eval tasks (SFT and RL) — dynamic from CHAT_TASKS
         chat_sft = m.get('chat_sft', {})
+        chat_sft_bpb = m.get('chat_sft_bpb', {})
         for task in CHAT_TASKS:
             row[f'{task.lower().replace("-", "_")}_sft'] = chat_sft.get(task)
+            row[f'{task.lower().replace("-", "_")}_sft_bpb'] = chat_sft_bpb.get(task)
         row['chatcore_sft'] = compute_chatcore(chat_sft)
 
         row['rl_final_reward'] = m.get('rl_final_reward')
         row['rl_forget_bpb'] = m.get('rl_forget_val_bpb')
+        row['rl_forget_core'] = m.get('rl_forget_core')
+        row['rl_forget_core_bpb'] = m.get('rl_forget_core_bpb')
 
         chat_rl = m.get('chat_rl', {})
+        chat_rl_bpb = m.get('chat_rl_bpb', {})
         for task in CHAT_TASKS:
             row[f'{task.lower().replace("-", "_")}_rl'] = chat_rl.get(task)
+            row[f'{task.lower().replace("-", "_")}_rl_bpb'] = chat_rl_bpb.get(task)
         row['chatcore_rl'] = compute_chatcore(chat_rl)
 
         row['total_time_sec'] = total_time
@@ -453,11 +489,19 @@ def display_results(results_dir, series_name, depths, all_metrics):
             ('SFT train loss',lambda m: m.get('sft_train_loss')),
             ('SFT val BPB',   lambda m: m.get('sft_val_bpb')),
             ('SFT→PT val',    lambda m: m.get('sft_forget_val_bpb')),
+            ('SFT→PT CORE BPB', lambda m: m.get('sft_forget_core_bpb')),
             ('RL→PT val',     lambda m: m.get('rl_forget_val_bpb')),
+            ('RL→PT CORE BPB', lambda m: m.get('rl_forget_core_bpb')),
         ]
         # Per-task CORE BPB
         for tname in core_task_names:
             bpb_getters.append((tname, core_task_getter(tname, 'bpb')))
+        # Chat eval per-task BPB (SFT, RL)
+        for source, key in [('sft', 'chat_sft_bpb'), ('rl', 'chat_rl_bpb')]:
+            sample = next((all_metrics[d].get(key, {}) for d in eval_depths if all_metrics[d].get(key)), {})
+            for task in sample:
+                bpb_getters.append((f'{task} ({source})',
+                    lambda m, k=key, t=task: (m.get(k) or {}).get(t)))
         scaling_table(eval_depths, all_metrics, bpb_getters, dec=4, better='lower')
 
     # =========================================================================
@@ -467,6 +511,8 @@ def display_results(results_dir, series_name, depths, all_metrics):
         section("SCALING: ACCURACY (across depths, higher is better)")
         acc_getters = [
             ('CORE (base eval)', lambda m: m.get('be_core') or m.get('pt_core')),
+            ('CORE (sft→pt)', lambda m: m.get('sft_forget_core')),
+            ('CORE (rl→pt)', lambda m: m.get('rl_forget_core')),
         ]
         # Per-task CORE accuracy
         for tname in core_task_names:
@@ -503,6 +549,34 @@ def display_results(results_dir, series_name, depths, all_metrics):
                 rl = m.get('rl_forget_val_bpb')
                 forget_rl = red(delta_str(rl, pt)) if rl and pt else dim('—')
                 row += [fmt(rl), forget_rl]
+            rows.append(row)
+        print_table(headers, rows)
+
+    # =========================================================================
+    # PIPELINE: CORE accuracy (PT → SFT → RL)
+    # =========================================================================
+    pipeline_core_depths = [d for d in depths if all_metrics[d].get('sft_forget_core') is not None]
+    if pipeline_core_depths:
+        section("PIPELINE: CORE ACCURACY (how pretraining accuracy changes through fine-tuning)")
+        has_rl = any(all_metrics[d].get('rl_forget_core') for d in pipeline_core_depths)
+        headers = ['depth', 'PT CORE', 'SFT→PT CORE', 'delta']
+        if has_rl:
+            headers += ['RL→PT CORE', 'delta']
+        rows = []
+        for d in pipeline_core_depths:
+            m = all_metrics[d]
+            pt = m.get('be_core') or m.get('pt_core')
+            sft = m.get('sft_forget_core')
+            delta_sft = delta_str(sft, pt)
+            if sft is not None and pt is not None:
+                delta_sft = green(delta_sft) if sft >= pt else red(delta_sft)
+            row = [str(d), fmt(pt), fmt(sft), delta_sft]
+            if has_rl:
+                rl = m.get('rl_forget_core')
+                delta_rl = delta_str(rl, pt)
+                if rl is not None and pt is not None:
+                    delta_rl = green(delta_rl) if rl >= pt else red(delta_rl)
+                row += [fmt(rl), delta_rl]
             rows.append(row)
         print_table(headers, rows)
 

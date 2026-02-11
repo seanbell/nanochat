@@ -165,7 +165,7 @@ for d in "${DEPTHS[@]}"; do
 
     run_stage "[5/8]" sft_holdout_bpb -- \
         torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval -- \
-            --source=sft --model-tag="${TAG}" --device-batch-size=$BS --eval=bpb
+            --source=sft --model-tag="${TAG}" --device-batch-size=$BS --eval=bpb,core
 done
 
 log "Phase 1 complete. Updating CSVs..."
@@ -198,7 +198,7 @@ for d in "${DEPTHS[@]}"; do
 
     run_stage "[8/8]" rl_holdout_bpb -- \
         torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval -- \
-            --source=rl --model-tag="${TAG}" --device-batch-size=$BS --eval=bpb
+            --source=rl --model-tag="${TAG}" --device-batch-size=$BS --eval=bpb,core
 done
 
 # Final CSV update and summary

@@ -8,6 +8,7 @@ python -m scripts.chat_eval -a ARC-Easy
 torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 """
 
+import math
 import argparse
 from functools import partial
 from contextlib import nullcontext
@@ -17,6 +18,7 @@ import torch.distributed as dist
 
 from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
+from nanochat.tokenizer import get_token_bytes
 from nanochat.engine import Engine
 
 from tasks.humaneval import HumanEval
@@ -32,11 +34,13 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
+    token_bytes = get_token_bytes(device=device)
 
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
 
     # Run the evaluation
     num_passed, total = 0, 0
+    total_nats, total_bytes = 0.0, 0
     for i in range(ddp_rank, num_problems, ddp_world_size):
         conversation = task_object[i]
 
@@ -57,6 +61,18 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         outcomes = [task_object.evaluate(conversation, completion) for completion in completions]
         passed = any(outcomes)
 
+        # Teacher-forced BPB: forward the reference answer through the model.
+        # No seq_len check needed — if it exceeded the limit, generate_batch above would have failed.
+        ids, mask = tokenizer.render_conversation(conversation)
+        ids_t = torch.tensor(ids, dtype=torch.long, device=device)
+        mask_t = torch.tensor(mask[1:], dtype=torch.long, device=device)
+        targets = ids_t[1:].clone()
+        targets[mask_t == 0] = -1  # only compute loss on answer tokens
+        with torch.no_grad():
+            loss_flat = model(ids_t[:-1].unsqueeze(0), targets.unsqueeze(0), loss_reduction='none')
+        total_nats += loss_flat.sum().item()
+        total_bytes += (token_bytes[ids_t[1:]] * mask_t).sum().item()
+
         # Keep stats
         total += 1
         num_passed += int(passed)
@@ -71,15 +87,22 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
     if ddp:
         num_passed_tensor = torch.tensor([num_passed], dtype=torch.long, device=device)
         total_tensor = torch.tensor([total], dtype=torch.long, device=device)
+        nats_tensor = torch.tensor([total_nats], dtype=torch.float64, device=device)
+        bytes_tensor = torch.tensor([total_bytes], dtype=torch.long, device=device)
         dist.all_reduce(num_passed_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(nats_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(bytes_tensor, op=dist.ReduceOp.SUM)
         num_passed = num_passed_tensor.item()
         total = total_tensor.item()
+        total_nats = nats_tensor.item()
+        total_bytes = bytes_tensor.item()
 
-    print0(f"{label}{num_passed}/{total} correct ({100*num_passed/total:.2f}%)")
+    accuracy = num_passed / total
+    bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('nan')
+    print0(f"{label}{num_passed}/{total} correct ({100*accuracy:.2f}%) | bpb: {bpb:.4f}")
 
-    # Return the accuracy
-    return num_passed/total
+    return accuracy, bpb
 
 # -----------------------------------------------------------------------------
 # Categorical evaluation loop
@@ -100,6 +123,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
     # Run the evaluation
     letter_to_id_cache = {} # many letters will repeat often, let's save the tokenizer some work
     num_passed, total = 0, 0
+    total_nats, total_bytes = 0.0, 0
     for i in range(ddp_rank, num_batches, ddp_world_size):
         i0, i1 = i * batch_size, min((i + 1) * batch_size, num_problems)
 
@@ -139,19 +163,36 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
             outcome = task_object.evaluate(conversation, predicted_letter)
             num_passed += int(outcome)
             total += 1
+            # BPB of correct answer (full-vocabulary cross-entropy, not constrained to letters)
+            correct_letter = conversation['messages'][-1]['content']
+            if correct_letter not in letter_to_id_cache:
+                encoded = tokenizer.encode(correct_letter)
+                assert len(encoded) == 1, "Correct letter must be a single token"
+                letter_to_id_cache[correct_letter] = encoded[0]
+            correct_id = letter_to_id_cache[correct_letter]
+            log_probs = torch.nn.functional.log_softmax(logits[idx, answer_pos, :], dim=-1)
+            total_nats += -log_probs[correct_id].item()
+            total_bytes += len(correct_letter.encode('utf-8'))
 
     # Aggregate results across all ranks
     if ddp:
         num_passed_tensor = torch.tensor([num_passed], dtype=torch.long, device=device)
         total_tensor = torch.tensor([total], dtype=torch.long, device=device)
+        nats_tensor = torch.tensor([total_nats], dtype=torch.float64, device=device)
+        bytes_tensor = torch.tensor([total_bytes], dtype=torch.long, device=device)
         dist.all_reduce(num_passed_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(nats_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(bytes_tensor, op=dist.ReduceOp.SUM)
         num_passed = num_passed_tensor.item()
         total = total_tensor.item()
+        total_nats = nats_tensor.item()
+        total_bytes = bytes_tensor.item()
 
-    average = num_passed/total
-    print0(f"{label}{num_passed}/{total} correct ({100*average:.2f}%)")
-    return average
+    average = num_passed / total
+    bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('nan')
+    print0(f"{label}{num_passed}/{total} correct ({100*average:.2f}%) | bpb: {bpb:.4f}")
+    return average, bpb
 
 # -----------------------------------------------------------------------------
 
@@ -171,12 +212,12 @@ def run_chat_eval(task_name, model, tokenizer, engine,
     task_label = f"{label}{task_name} " if label else f"{task_name} "
     # Run the evaluation
     if task_object.eval_type == 'generative':
-        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems, label=task_label)
+        acc, bpb = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems, label=task_label)
     elif task_object.eval_type == 'categorical':
-        acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems, label=task_label)
+        acc, bpb = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems, label=task_label)
     else:
         raise ValueError(f"Unsupported task evaluation type: {task_object.eval_type}")
-    return acc
+    return acc, bpb
 
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -221,9 +262,10 @@ if __name__ == "__main__":
 
     # Run all the task evaluations sequentially
     results = {}
+    bpb_results = {}
     for task_name in task_names:
         with autocast_ctx:
-            acc = run_chat_eval(
+            acc, bpb = run_chat_eval(
                 task_name,
                 model, tokenizer, engine,
                 batch_size=args.batch_size,
@@ -235,7 +277,8 @@ if __name__ == "__main__":
                 label=eval_label,
             )
             results[task_name] = acc
-            print0(f"{eval_label}{task_name} accuracy: {100 * acc:.2f}%")
+            bpb_results[task_name] = bpb
+            print0(f"{eval_label}{task_name} accuracy: {100 * acc:.2f}% | bpb: {bpb:.4f}")
 
     # Log to report
     from nanochat.report import get_report
@@ -254,6 +297,7 @@ if __name__ == "__main__":
     get_report().log(section="Chat evaluation " + args.source, data=[
         vars(args), # CLI args
         results,
+        bpb_results,
         chatcore_metric_dict,
     ])
 
