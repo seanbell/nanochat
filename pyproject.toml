@@ -14,6 +14,9 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "regex>=2025.9.1",
     "rustbpe>=0.1.0",
+    "scikit-learn>=1.6.0",
+    "flash-attn>=2.6.0; python_version == '3.10'",
+    "sentence-transformers>=2.7.0",
     "scipy>=1.15.3",
     "setuptools>=80.9.0",
     "tabulate>=0.9.0",
@@ -46,6 +49,7 @@ torch = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu128", extra = "gpu" },
 ]
+flash-attn = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.6.3+cu128torch2.9-cp310-cp310-linux_x86_64.whl" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
