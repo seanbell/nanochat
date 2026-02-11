@@ -35,16 +35,13 @@ from typing import NamedTuple
 import numpy as np
 import torch
 import torch.multiprocessing as mp
-from datasets import load_dataset
 from tqdm import tqdm
 
-from nanochat.common import get_base_dir
+from nanochat.common import curated_paths
 from tasks.hfchat import (
-    _is_valid_conversation, _stringify_content,
     _extract_turns, _count_turns, _conversation_text,
+    load_sft_conversations, NUM_CPU_PROC,
 )
-
-NUM_CPU_PROC = min(96, os.cpu_count() or 1)
 EMBED_PROMPT = "Instruct: Represent this conversation for similarity clustering\nQuery: "
 
 def _stage(name):
@@ -355,45 +352,25 @@ def main():
     _stage("Stage 1: Load & Filter")
     t0 = time.time()
 
-    ds = load_dataset(args.dataset)
-    raw = ds["train"]
-    print(f"Loaded {len(raw):,} rows from {args.dataset}")
+    conversations = load_sft_conversations(args.dataset, downsample=args.downsample, seed=args.seed)
 
-    # Downsample early (before filtering) to speed up the entire pipeline
-    if args.downsample > 0 and args.downsample < len(raw):
-        rng = np.random.RandomState(args.seed)
-        keep = rng.choice(len(raw), size=args.downsample, replace=False)
-        keep.sort()
-        raw = raw.select(keep)
-        print(f"Downsampled to {len(raw):,} rows (--downsample {args.downsample})")
-
-    # Fill in defaults (after downsample so we can scale to dataset size)
+    # Fill in defaults (scale to dataset size)
     if args.num_clusters is None:
-        args.num_clusters = max(4, min(256, len(raw) // 32))
+        args.num_clusters = max(4, min(256, len(conversations) // 32))
         print(f"  Auto --num-clusters={args.num_clusters}")
     if args.target_rows is None:
-        args.target_rows = max(10, min(500_000, len(raw) // 2))
+        args.target_rows = max(10, min(500_000, len(conversations) // 2))
         print(f"  Auto --target-rows={args.target_rows}")
 
-    # Filter invalid conversations + stringify content (multi-process)
-    before = len(raw)
-    raw = raw.filter(_is_valid_conversation, num_proc=NUM_CPU_PROC, desc="Validating conversations")
-    raw = raw.map(_stringify_content, num_proc=NUM_CPU_PROC, desc="Stringify content")
-    if before != len(raw):
-        print(f"Filtered {before - len(raw):,} invalid conversations ({before:,} -> {len(raw):,})")
-
-    conversations = []
-    for batch in tqdm(raw.iter(batch_size=10000), total=(len(raw) + 9999) // 10000, desc="Extracting conversations"):
-        conversations.extend({"messages": msgs} for msgs in batch["messages"])
     print(f"Stage 1 done: {len(conversations):,} conversations in {time.time() - t0:.1f}s")
 
     # ----------
     _stage("Stage 2: Embed")
 
-    base_dir = get_base_dir()
-    curated_dir = os.path.join(base_dir, "curated")
+    paths = curated_paths(args.output_name)
+    curated_dir = paths["dir"]
     os.makedirs(curated_dir, exist_ok=True)
-    embed_path = os.path.join(curated_dir, f"{args.output_name}_embeddings.npy")
+    embed_path = paths["embeddings"]
 
     if os.path.exists(embed_path):
         print(f"Checkpoint found: {embed_path}, loading...")
@@ -407,7 +384,7 @@ def main():
         print(f"Embedding with {num_gpus} GPU(s), model={args.embed_model}")
 
         # Tokenize (or load checkpoint)
-        tok_path = os.path.join(curated_dir, f"{args.output_name}_tokens.npz")
+        tok_path = paths["tokens"]
         if not os.path.exists(tok_path):
             texts = [_conversation_text(conv["messages"]) for conv in tqdm(conversations, desc="Extracting conversation texts")]
 
@@ -510,7 +487,7 @@ def main():
     # ----------
     _stage("Stage 3: Cluster")
 
-    cluster_path = os.path.join(curated_dir, f"{args.output_name}_clusters.npy")
+    cluster_path = paths["clusters"]
     if os.path.exists(cluster_path):
         print(f"Checkpoint found: {cluster_path}, loading...")
         cluster_labels = np.load(cluster_path)
@@ -535,7 +512,7 @@ def main():
     # ----------
     _stage("Stage 4: IFD Score")
 
-    ifd_path = os.path.join(curated_dir, f"{args.output_name}_ifd.npy")
+    ifd_path = paths["ifd"]
     if os.path.exists(ifd_path):
         print(f"Checkpoint found: {ifd_path}, loading...")
         ifd_diffs = np.load(ifd_path)
@@ -670,11 +647,14 @@ def main():
     _stage("Stage 6: Save")
     t0 = time.time()
 
-    output_path = os.path.join(curated_dir, f"{args.output_name}.jsonl")
+    output_path = paths["jsonl"]
     selected_indices.sort()
     with open(output_path, "w") as f:
         for idx in selected_indices:
-            f.write(json.dumps(conversations[idx]) + "\n")
+            row = {**conversations[idx],
+                   "cluster": int(cluster_labels[idx]),
+                   "ifd_diff": round(float(ifd_diffs[idx]), 6)}
+            f.write(json.dumps(row) + "\n")
     print(f"Saved {len(selected_indices):,} conversations to {output_path}")
 
     # ----------

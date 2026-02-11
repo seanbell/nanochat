@@ -58,6 +58,124 @@ def get_base_dir():
     os.makedirs(nanochat_dir, exist_ok=True)
     return nanochat_dir
 
+def curated_paths(output_name):
+    """Return paths dict for all checkpoint files of a curation run."""
+    curated_dir = os.path.join(get_base_dir(), "curated")
+    return {
+        "dir": curated_dir,
+        "jsonl": os.path.join(curated_dir, f"{output_name}.jsonl"),
+        "embeddings": os.path.join(curated_dir, f"{output_name}_embeddings.npy"),
+        "clusters": os.path.join(curated_dir, f"{output_name}_clusters.npy"),
+        "ifd": os.path.join(curated_dir, f"{output_name}_ifd.npy"),
+        "tokens": os.path.join(curated_dir, f"{output_name}_tokens.npz"),
+    }
+
+
+def load_curated_data(output_name, dataset=None, downsample=0, seed=42):
+    """Load curated conversations with cluster/IFD metadata from checkpoint files.
+
+    Handles all loading strategies:
+    - JSONL with embedded metadata (fastest path)
+    - JSONL without metadata + source dataset for backfill
+    - Source dataset with numpy overlays (pre-JSONL browsing)
+    - Stats-only from numpy arrays (no conversations)
+
+    Returns dict: conversations, n_total, has_jsonl, completed_stages.
+    Each conversation dict will have 'cluster' and 'ifd_diff' keys injected
+    when the corresponding numpy checkpoints exist.
+    """
+    import json
+    import time
+    import numpy as np
+
+    paths = curated_paths(output_name)
+    conversations = []
+    n_total = 0
+    has_jsonl = False
+    completed_stages = []
+
+    # Load numpy checkpoints (these index the full filtered dataset)
+    cluster_labels = None
+    ifd_diffs = None
+    if os.path.exists(paths["clusters"]):
+        cluster_labels = np.load(paths["clusters"])
+        n_total = len(cluster_labels)
+        completed_stages.append("clusters")
+        print(f"Loaded clusters: {len(cluster_labels):,} items, {len(np.unique(cluster_labels))} clusters")
+    if os.path.exists(paths["ifd"]):
+        ifd_diffs = np.load(paths["ifd"])
+        n_total = max(n_total, len(ifd_diffs))
+        completed_stages.append("ifd")
+        print(f"Loaded IFD diffs: {len(ifd_diffs):,} items")
+    if os.path.exists(paths["embeddings"]):
+        completed_stages.append("embeddings")
+
+    # Load conversations: prefer JSONL, fall back to source dataset
+    if os.path.exists(paths["jsonl"]):
+        print(f"Loading {paths['jsonl']}...")
+        t0 = time.time()
+        with open(paths["jsonl"]) as f:
+            conversations = [json.loads(line) for line in f]
+        has_jsonl = True
+        completed_stages.append("jsonl")
+        print(f"Loaded {len(conversations):,} curated conversations in {time.time() - t0:.1f}s")
+
+        # Backfill metadata if JSONL was written by older version without it
+        if conversations and "cluster" not in conversations[0] and dataset and cluster_labels is not None:
+            print("JSONL lacks cluster/ifd metadata. Loading source dataset to backfill...")
+            t0 = time.time()
+            from tasks.hfchat import load_sft_conversations
+            source = load_sft_conversations(dataset, downsample=downsample, seed=seed)
+            source_lookup = {}
+            for i, conv in enumerate(source):
+                msgs = conv.get("messages", [])
+                if msgs:
+                    source_lookup[msgs[0]["content"]] = i
+            mapped = 0
+            for conv in conversations:
+                msgs = conv.get("messages", [])
+                src_idx = source_lookup.get(msgs[0]["content"]) if msgs else None
+                if src_idx is not None:
+                    if src_idx < len(cluster_labels):
+                        conv["cluster"] = int(cluster_labels[src_idx])
+                    if ifd_diffs is not None and src_idx < len(ifd_diffs):
+                        conv["ifd_diff"] = float(ifd_diffs[src_idx])
+                    mapped += 1
+            del source, source_lookup
+            print(f"Backfilled {mapped:,}/{len(conversations):,} conversations in {time.time() - t0:.1f}s")
+
+    elif dataset:
+        print(f"JSONL not yet produced. Loading source dataset: {dataset}")
+        t0 = time.time()
+        from tasks.hfchat import load_sft_conversations
+        conversations = load_sft_conversations(dataset, downsample=downsample, seed=seed)
+        print(f"Loaded {len(conversations):,} conversations in {time.time() - t0:.1f}s")
+
+        # Overlay numpy arrays directly (they index the same filtered dataset)
+        if cluster_labels is not None:
+            if len(cluster_labels) == len(conversations):
+                for i, conv in enumerate(conversations):
+                    conv["cluster"] = int(cluster_labels[i])
+            else:
+                print(f"WARNING: cluster array size ({len(cluster_labels)}) != conversation count ({len(conversations)})")
+        if ifd_diffs is not None:
+            if len(ifd_diffs) == len(conversations):
+                for i, conv in enumerate(conversations):
+                    conv["ifd_diff"] = float(ifd_diffs[i])
+            else:
+                print(f"WARNING: IFD array size ({len(ifd_diffs)}) != conversation count ({len(conversations)})")
+    else:
+        if n_total == 0:
+            raise SystemExit(f"No data found for '{output_name}'. Run curate_sft.py first, or pass --dataset.")
+        print(f"Stats-only mode: {n_total:,} items from numpy arrays (pass --dataset to browse)")
+
+    return {
+        "conversations": conversations,
+        "n_total": n_total,
+        "has_jsonl": has_jsonl,
+        "completed_stages": completed_stages,
+    }
+
 def download_file_with_lock(url, filename, postprocess_fn=None):
     """
     Downloads a file from a URL to a local path in the base directory.

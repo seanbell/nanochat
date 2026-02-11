@@ -16,9 +16,12 @@ are automatically filtered out, since the tokenizer expects strict user/assistan
 
 import copy
 import os
+import numpy as np
 from datasets import load_dataset
 from nanochat.common import get_base_dir
 from tasks.common import Task
+
+NUM_CPU_PROC = min(96, os.cpu_count() or 1)
 
 # ---------------------------------------------------------------------------
 # Chat validation & extraction helpers (used by HFChat and curate_sft)
@@ -71,6 +74,32 @@ def _count_turns(messages):
 def _conversation_text(messages):
     """Concatenate all message content for embedding."""
     return "\n".join(msg["content"] for msg in messages)
+
+def load_sft_conversations(dataset_name, downsample=0, seed=42):
+    """Load an HF chat dataset, applying the same filtering as curate_sft Stage 1.
+
+    Returns list of dicts with "messages" key, in deterministic order.
+    Used by curate_sft.py and curate_sft_web.py to ensure identical indexing.
+    """
+    ds = load_dataset(dataset_name)
+    raw = ds["train"]
+    print(f"Loaded {len(raw):,} rows from {dataset_name}")
+
+    if downsample > 0 and downsample < len(raw):
+        rng = np.random.RandomState(seed)
+        keep = rng.choice(len(raw), size=downsample, replace=False)
+        keep.sort()
+        raw = raw.select(keep)
+        print(f"Downsampled to {len(raw):,} rows")
+
+    before = len(raw)
+    raw = raw.filter(_is_valid_conversation, num_proc=NUM_CPU_PROC, desc="Validating conversations")
+    raw = raw.map(_stringify_content, num_proc=NUM_CPU_PROC, desc="Stringify content")
+    if before != len(raw):
+        print(f"Filtered {before - len(raw):,} invalid conversations ({before:,} -> {len(raw):,})")
+
+    return [{"messages": msgs} for msgs in raw["messages"]]
+
 
 class HFChat(Task):
 
