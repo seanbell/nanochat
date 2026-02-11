@@ -60,6 +60,8 @@ parser.add_argument("--eval-every", type=int, default=150, help="evaluate val bp
 parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
 # Data
 parser.add_argument("--datamix", type=str, default="", help="HuggingFace dataset for SFT (e.g. allenai/tulu-3-sft-mixture). Empty = default mix.")
+# Loss masking
+parser.add_argument("--assistant-only", action="store_true", help="train only on assistant response tokens (uses mask from render_conversation)")
 # Output
 parser.add_argument("--dry-run", action="store_true", help="log to wandb but skip checkpoints/report")
 args = parser.parse_args()
@@ -155,6 +157,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
     # Conversation buffer: list of token lists
     conv_buffer = []
+    mask_buffer = []  # parallel buffer for response masks (--assistant-only)
     cursor = ddp_rank  # Each rank processes different conversations (for fetching)
     consumed = ddp_rank  # Track actual consumption separately from buffering
     epoch = 1
@@ -164,8 +167,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, _ = tokenizer.render_conversation(conversation)
+            ids, mask = tokenizer.render_conversation(conversation)
             conv_buffer.append(ids)
+            mask_buffer.append(mask)
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
@@ -174,9 +178,11 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
     while True:
         rows = []
+        row_masks = [] if args.assistant_only else None
         row_lengths = []  # Track actual content length (excluding padding) for each row
         for _ in range(args.device_batch_size):
             row = []
+            row_mask = [] if args.assistant_only else None
             padded = False
             while len(row) < row_capacity:
                 # Ensure buffer has conversations
@@ -198,12 +204,18 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     # Found a conversation that fits - use it entirely
                     conv = conv_buffer.pop(best_idx)
                     row.extend(conv)
+                    if args.assistant_only:
+                        row_mask.extend(mask_buffer.pop(best_idx))
+                    else:
+                        mask_buffer.pop(best_idx)
                     consumed += ddp_world_size  # Track actual consumption
                 else:
                     # No conversation fits - pad the remainder instead of cropping
                     # This ensures we never discard any tokens
                     content_len = len(row)
                     row.extend([bos_token] * remaining)  # Pad with BOS tokens
+                    if args.assistant_only:
+                        row_mask.extend([0] * remaining)
                     padded = True
                     break  # Row is now full (with padding)
 
@@ -213,6 +225,8 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             else:
                 row_lengths.append(row_capacity)
             rows.append(row[:row_capacity])
+            if args.assistant_only:
+                row_masks.append(row_mask[:row_capacity])
 
         # Stopping condition to respect num_iterations, if given
         it += 1
@@ -241,6 +255,13 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         for i, content_len in enumerate(row_lengths):
             if content_len < row_capacity:
                 targets[i, content_len-1:] = -1
+
+        # --assistant-only: additionally mask non-response tokens (user turns, BOS, etc.)
+        if args.assistant_only:
+            mask_tensor = torch.tensor(row_masks, dtype=torch.long, pin_memory=use_cuda)
+            # targets[i, t] predicts token t+1, so use mask[t+1]
+            shifted_mask = mask_tensor[:, 1:].to(device=device, non_blocking=use_cuda)
+            targets[shifted_mask == 0] = -1
 
         yield inputs, targets
 

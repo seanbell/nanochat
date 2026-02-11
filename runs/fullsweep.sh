@@ -157,7 +157,7 @@ for d in "${DEPTHS[@]}"; do
     run_stage "[3/8]" sft --timed -- \
         torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- \
             --run="${WANDB_RUN}_d${d}_sft" --model-tag="${TAG}" --device-batch-size=$BS \
-            $SFT_EXTRA_ARGS
+            --assistant-only $SFT_EXTRA_ARGS
 
     run_stage "[4/8]" chat_eval_sft -- \
         torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- \
